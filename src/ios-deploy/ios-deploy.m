@@ -504,7 +504,7 @@ CFMutableArrayRef copy_device_product_version_parts(AMDeviceRef device) {
 CFStringRef copy_device_support_path(AMDeviceRef device, CFStringRef suffix) {
     time_t startTime, endTime;
     time( &startTime );
-	
+    
     CFStringRef version = NULL;
     CFStringRef build = AMDeviceCopyValue(device, 0, CFSTR("BuildVersion"));
     CFStringRef deviceClass = AMDeviceCopyValue(device, 0, CFSTR("DeviceClass"));
@@ -596,7 +596,7 @@ CFStringRef copy_device_support_path(AMDeviceRef device, CFStringRef suffix) {
           @"Status": msg,
         });
         on_error(msg);
-	}
+    }
     
     time( &endTime );
     NSLogVerbose(@"DeviceSupport directory '%@' was located. It took %.2f seconds", path, difftime(endTime,startTime));

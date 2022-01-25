@@ -3,6 +3,7 @@
 #import <CoreFoundation/CoreFoundation.h>
 #import <Foundation/Foundation.h>
 #include <unistd.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -13,6 +14,7 @@
 #include <getopt.h>
 #include <pwd.h>
 #include <dlfcn.h>
+#include <time.h>
 
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -30,7 +32,7 @@
  * log enable -v -f /Users/vargaz/gdb-remote.log gdb-remote all
  */
 #define LLDB_PREP_CMDS CFSTR("\
-    platform select remote-ios --sysroot '{symbols_path}'\n\
+    platform select remote-'{platform}' --sysroot '{symbols_path}'\n\
     target create \"{disk_app}\"\n\
     script fruitstrap_device_app=\"{device_app}\"\n\
     script fruitstrap_connect_url=\"connect://127.0.0.1:{device_port}\"\n\
@@ -88,16 +90,21 @@ int AMDeviceSecureInstallApplicationBundle(AMDeviceRef device, CFURLRef url, CFD
 int AMDeviceMountImage(AMDeviceRef device, CFStringRef image, CFDictionaryRef options, void *callback, int cbarg);
 mach_error_t AMDeviceLookupApplications(AMDeviceRef device, CFDictionaryRef options, CFDictionaryRef *result);
 int AMDeviceGetInterfaceType(AMDeviceRef device);
+AMDeviceRef AMDeviceCopyPairedCompanion(AMDeviceRef device);
 
 int AMDServiceConnectionSend(ServiceConnRef con, const void * data, size_t size);
 int AMDServiceConnectionReceive(ServiceConnRef con, void * data, size_t size);
+uint64_t AMDServiceConnectionReceiveMessage(ServiceConnRef con, CFPropertyListRef message, CFPropertyListFormat *format);
+uint64_t AMDServiceConnectionSendMessage(ServiceConnRef con, CFPropertyListRef message, CFPropertyListFormat format);
 
 bool found_device = false, debug = false, verbose = false, unbuffered = false, nostart = false, debugserver_only = false, detect_only = false, install = true, uninstall = false, no_wifi = false;
+bool faster_path_search = false;
 bool command_only = false;
 char *command = NULL;
 char const*target_filename = NULL;
 char const*upload_pathname = NULL;
 char *bundle_id = NULL;
+NSMutableArray *keys = NULL;
 bool interactive = true;
 bool justlaunch = false;
 bool file_system = false;
@@ -109,12 +116,12 @@ char *args = NULL;
 char *envs = NULL;
 char *list_root = NULL;
 const char * custom_script_path = NULL;
+char *symbols_download_directory = NULL;
 int _timeout = 0;
 int _detectDeadlockTimeout = 0;
 bool _json_output = false;
 NSMutableArray *_file_meta_info = nil;
 int port = 0;    // 0 means "dynamically assigned"
-CFStringRef last_path = NULL;
 ServiceConnRef dbgServiceConnection = NULL;
 pid_t parent = 0;
 // PID of child process running lldb
@@ -126,6 +133,13 @@ struct am_device_notification *notify;
 CFRunLoopSourceRef lldb_socket_runloop;
 CFRunLoopSourceRef server_socket_runloop;
 CFRunLoopSourceRef fdvendor_runloop;
+
+uint32_t symbols_file_paths_command = 0x30303030;
+uint32_t symbols_download_file_command = 0x01000000;
+CFStringRef symbols_service_name = CFSTR("com.apple.dt.fetchsymbols");
+const int symbols_logging_interval_ms = 250;
+
+const size_t sizeof_uint32_t = sizeof(uint32_t);
 
 // Error codes we report on different failures, so scripts can distinguish between user app exit
 // codes and our exit codes. For non app errors we use codes in reserved 128-255 range.
@@ -146,6 +160,20 @@ const int exitcode_app_crash = 254;
         }                                                                       \
     } while (false);
 
+// Checks for MobileDevice.framework errors and tries to print them.
+#define log_error(call)                                                       \
+    do {                                                                        \
+        unsigned int err = (unsigned int)call;                                  \
+        if (err != 0)                                                           \
+        {                                                                       \
+            const char* msg = get_error_message(err);                           \
+            NSString *description = msg ? [NSString stringWithUTF8String:msg] : @"unknown."; \
+            NSLogJSON(@{@"Event": @"Error", @"Code": @(err), @"Status": description}); \
+            log_on_error(@"Error 0x%x: %@ " #call, err, description);               \
+        }                                                                       \
+    } while (false);
+
+
 
 void disable_ssl(ServiceConnRef con)
 {
@@ -159,6 +187,18 @@ void disable_ssl(ServiceConnRef con)
 
     SSL_free(con->sslContext);
     con->sslContext = NULL;
+}
+
+void log_on_error(NSString* format, ...)
+{
+    va_list valist;
+    va_start(valist, format);
+    NSString* str = [[[NSString alloc] initWithFormat:format arguments:valist] autorelease];
+    va_end(valist);
+
+    if (!_json_output) {
+        NSLog(@"[ !! ] %@", str);
+    }
 }
 
 
@@ -227,6 +267,9 @@ void NSLogJSON(NSDictionary* jsonDict) {
     }
 }
 
+uint64_t get_current_time_in_milliseconds() {
+    return clock_gettime_nsec_np(CLOCK_REALTIME) / (1000 * 1000);
+}
 
 BOOL mkdirp(NSString* path) {
     NSError* error = nil;
@@ -256,22 +299,34 @@ CFStringRef copy_find_path(CFStringRef rootPath, CFStringRef namePattern) {
 
     if( !path_exists(rootPath) )
         return NULL;
-    
-    if (CFStringFind(namePattern, CFSTR("*"), 0).location == kCFNotFound) {
-        //No wildcards. Let's speed up the search
-        CFStringRef path = CFStringCreateWithFormat(NULL, NULL, CFSTR("%@/%@"), rootPath, namePattern);
-        
-        if( path_exists(path) )
-            return path;
-        
-        CFRelease(path);
-        return NULL;
+
+    if (faster_path_search) {
+        CFIndex maxdepth = 1;
+        CFArrayRef findPathSlash = CFStringCreateArrayWithFindResults(NULL, namePattern, CFSTR("/"), CFRangeMake(0, CFStringGetLength(namePattern)), 0);
+        if (findPathSlash != NULL) {
+            maxdepth = CFArrayGetCount(findPathSlash) + 1;
+            CFRelease(findPathSlash);
+        }
+
+        cf_command = CFStringCreateWithFormat(NULL, NULL, CFSTR("find '%@' -path '%@/%@' -maxdepth %ld 2>/dev/null | sort | tail -n 1"), rootPath, rootPath, namePattern, maxdepth);
     }
-    
-    if (CFStringFind(namePattern, CFSTR("/"), 0).location == kCFNotFound) {
-        cf_command = CFStringCreateWithFormat(NULL, NULL, CFSTR("find '%@' -name '%@' -maxdepth 1 2>/dev/null | sort | tail -n 1"), rootPath, namePattern);
-    } else {
-        cf_command = CFStringCreateWithFormat(NULL, NULL, CFSTR("find '%@' -path '%@/%@' 2>/dev/null | sort | tail -n 1"), rootPath, rootPath, namePattern);
+    else {
+        if (CFStringFind(namePattern, CFSTR("*"), 0).location == kCFNotFound) {
+            //No wildcards. Let's speed up the search
+            CFStringRef path = CFStringCreateWithFormat(NULL, NULL, CFSTR("%@/%@"), rootPath, namePattern);
+            
+            if( path_exists(path) )
+                return path;
+            
+            CFRelease(path);
+            return NULL;
+        }
+        
+        if (CFStringFind(namePattern, CFSTR("/"), 0).location == kCFNotFound) {
+            cf_command = CFStringCreateWithFormat(NULL, NULL, CFSTR("find '%@' -name '%@' -maxdepth 1 2>/dev/null | sort | tail -n 1"), rootPath, namePattern);
+        } else {
+            cf_command = CFStringCreateWithFormat(NULL, NULL, CFSTR("find '%@' -path '%@/%@' 2>/dev/null | sort | tail -n 1"), rootPath, rootPath, namePattern);
+        }
     }
 
     char command[1024] = { '\0' };
@@ -297,27 +352,43 @@ CFStringRef copy_find_path(CFStringRef rootPath, CFStringRef namePattern) {
     return NULL;
 }
 
-CFStringRef copy_xcode_dev_path() {
+CFStringRef copy_xcode_dev_path(void) {
     static char xcode_dev_path[256] = { '\0' };
     if (strlen(xcode_dev_path) == 0) {
-        FILE *fpipe = NULL;
-        char *command = "xcode-select -print-path";
+        const char* env_dev_path = getenv("DEVELOPER_DIR");
+        
+        if (env_dev_path && strlen(env_dev_path) > 0) {
+            strcpy(xcode_dev_path, env_dev_path);
+            // DEVELOPER_DIR should refer to Xcode.app/Contents/Developer, but
+            // xcode-select and friends have an extension to fix the path, if it points to Xcode.app/.
+            static char dev_subdir[256] = { '\0' };
+            strcat(strcat(dev_subdir, env_dev_path), "/Contents/Developer");
+            struct stat sb;
+            if (stat(dev_subdir, &sb) == 0)
+            {
+                strcpy(xcode_dev_path, dev_subdir);
+            }
+        } else {
+            FILE *fpipe = NULL;
+            char *command = "xcode-select -print-path";
 
-        if (!(fpipe = (FILE *)popen(command, "r")))
-            on_sys_error(@"Error encountered while opening pipe");
+            if (!(fpipe = (FILE *)popen(command, "r")))
+                on_sys_error(@"Error encountered while opening pipe");
 
-        char buffer[256] = { '\0' };
+            char buffer[256] = { '\0' };
 
-        fgets(buffer, sizeof(buffer), fpipe);
-        pclose(fpipe);
+            fgets(buffer, sizeof(buffer), fpipe);
+            pclose(fpipe);
 
-        strtok(buffer, "\n");
-        strcpy(xcode_dev_path, buffer);
+            strtok(buffer, "\n");
+            strcpy(xcode_dev_path, buffer);
+        }
+        NSLogVerbose(@"Found Xcode developer dir %s", xcode_dev_path);
     }
     return CFStringCreateWithCString(NULL, xcode_dev_path, kCFStringEncodingUTF8);
 }
 
-const char *get_home() {
+const char *get_home(void) {
     const char* home = getenv("HOME");
     if (!home) {
         struct passwd *pwd = getpwuid(getuid());
@@ -429,7 +500,7 @@ CFStringRef get_device_full_name(const AMDeviceRef device) {
         CFRelease(device_name);
     if(model != NULL)
         CFRelease(model);
-    if(model_name != NULL)
+    if(model_name != NULL && model_name != model)
         CFRelease(model_name);
     if(product_version)
         CFRelease(product_version);
@@ -482,13 +553,33 @@ NSDictionary* get_device_json_dict(const AMDeviceRef device) {
     return CFAutorelease(json_dict);
 }
 
+int get_companion_interface_type(AMDeviceRef device)
+{
+    assert(AMDeviceGetInterfaceType(device) == 3);
+    AMDeviceRef companion = AMDeviceCopyPairedCompanion(device);
+    int type = AMDeviceGetInterfaceType(companion);
+    AMDeviceRelease(companion);
+    return type;
+}
+
 CFStringRef get_device_interface_name(const AMDeviceRef device) {
-    // AMDeviceGetInterfaceType(device) 0=Unknown, 1 = Direct/USB, 2 = Indirect/WIFI
+    // AMDeviceGetInterfaceType(device) 0=Unknown, 1 = Direct/USB, 2 = Indirect/WIFI, 3 = Companion proxy
     switch(AMDeviceGetInterfaceType(device)) {
         case 1:
             return CFSTR("USB");
         case 2:
             return CFSTR("WIFI");
+        case 3:
+        {
+            if (get_companion_interface_type(device) == 1)
+            {
+                return CFSTR("USB Companion proxy");
+            }
+            else
+            {
+                return CFSTR("WIFI Companion proxy");
+            }
+        }
         default:
             return CFSTR("Unknown Connection");
     }
@@ -511,6 +602,7 @@ CFStringRef copy_device_support_path(AMDeviceRef device, CFStringRef suffix) {
     CFStringRef build = AMDeviceCopyValue(device, 0, CFSTR("BuildVersion"));
     CFStringRef deviceClass = AMDeviceCopyValue(device, 0, CFSTR("DeviceClass"));
     CFStringRef deviceModel = AMDeviceCopyValue(device, 0, CFSTR("HardwareModel"));
+    CFStringRef productType = AMDeviceCopyValue(device, 0, CFSTR("ProductType"));
     CFStringRef deviceArch = NULL;
     CFStringRef path = NULL;
 
@@ -530,7 +622,12 @@ CFStringRef copy_device_support_path(AMDeviceRef device, CFStringRef suffix) {
     if (CFStringCompare(CFSTR("AppleTV"), deviceClass, 0) == kCFCompareEqualTo) {
       deviceClassPath[0] = CFSTR("Platforms/AppleTVOS.platform/DeviceSupport");
       deviceClassPath[1] = CFSTR("tvOS DeviceSupport");
-    } else {
+    }
+    else if (CFStringCompare(CFSTR("Watch"), deviceClass, 0) == kCFCompareEqualTo) {
+      deviceClassPath[0] = CFSTR("Platforms/WatchOS.platform/DeviceSupport");
+      deviceClassPath[1] = CFSTR("watchOS DeviceSupport");
+    }
+    else {
       deviceClassPath[0] = CFSTR("Platforms/iPhoneOS.platform/DeviceSupport");
       deviceClassPath[1] = CFSTR("iOS DeviceSupport");
     }
@@ -568,6 +665,11 @@ CFStringRef copy_device_support_path(AMDeviceRef device, CFStringRef suffix) {
                 path = copy_xcode_path_for(deviceClassPath[i], search);
                 CFRelease(search);
             }
+            if (path == NULL) {
+                CFStringRef search = CFStringCreateWithFormat(NULL, NULL, CFSTR("%@ %@ (%@)/%@"), productType, version, build, suffix);
+                path = copy_xcode_path_for(deviceClassPath[i], search);
+                CFRelease(search);
+            }
         }
         
         CFRelease(version);
@@ -588,6 +690,7 @@ CFStringRef copy_device_support_path(AMDeviceRef device, CFStringRef suffix) {
     CFRelease(version_parts);
     CFRelease(build);
     CFRelease(deviceClass);
+    CFRelease(productType);
     if (deviceModel != NULL) {
         CFRelease(deviceModel);
     }
@@ -660,16 +763,17 @@ void mount_developer_image(AMDeviceRef device) {
         
         on_error(@"Unable to mount developer disk image. (%x)", result);
     }
-	
+  
     CFStringRef symbols_path = copy_device_support_path(device, CFSTR("Symbols"));
     if (symbols_path != NULL)
     {
         NSLogOut(@"Symbol Path: %@", symbols_path);
         NSLogJSON(@{@"Event": @"MountDeveloperImage",
                     @"SymbolsPath": (__bridge NSString *)symbols_path
-                    });		CFRelease(symbols_path);
+                    });
+        CFRelease(symbols_path);
     }
-	
+  
     CFRelease(image_path);
     CFRelease(options);
 }
@@ -683,10 +787,13 @@ mach_error_t transfer_callback(CFDictionaryRef dict, int arg) {
     CFNumberGetValue(CFDictionaryGetValue(dict, CFSTR("PercentComplete")), kCFNumberSInt32Type, &percent);
 
     if (CFEqual(status, CFSTR("CopyingFile"))) {
-        CFStringRef path = CFDictionaryGetValue(dict, CFSTR("Path"));
+        static CFStringRef last_path = NULL;
+        static int last_overall_percent = -1;
 
-        if ((last_path == NULL || !CFEqual(path, last_path)) && !CFStringHasSuffix(path, CFSTR(".ipa"))) {
-            int overall_percent = percent / 2;
+        CFStringRef path = CFDictionaryGetValue(dict, CFSTR("Path"));
+        int overall_percent = percent / 2;
+
+        if ((last_path == NULL || !CFEqual(path, last_path) || last_overall_percent != overall_percent) && !CFStringHasSuffix(path, CFSTR(".ipa"))) {
             NSLogOut(@"[%3d%%] Copying %@ to device", overall_percent, path);
             NSLogJSON(@{@"Event": @"BundleCopy",
                         @"OverallPercent": @(overall_percent),
@@ -694,6 +801,8 @@ mach_error_t transfer_callback(CFDictionaryRef dict, int arg) {
                         @"Path": (__bridge NSString *)path
                         });
         }
+
+        last_overall_percent = overall_percent;
 
         if (last_path != NULL) {
             CFRelease(last_path);
@@ -822,10 +931,30 @@ CFStringRef copy_modules_search_paths_pairs(CFStringRef symbols_path, CFStringRe
     return res;
 }
 
+CFStringRef get_device_platform(AMDeviceRef device)
+{
+    CFStringRef deviceClass = AMDeviceCopyValue(device, 0, CFSTR("DeviceClass"));
+    CFStringRef platform;
+    if (CFStringCompare(CFSTR("AppleTV"), deviceClass, 0) == kCFCompareEqualTo) {
+        platform = CFSTR("tvos");
+    }
+    else if (CFStringCompare(CFSTR("Watch"), deviceClass, 0) == kCFCompareEqualTo) {
+        platform = CFSTR("watchos");
+    }
+    else {
+        platform = CFSTR("ios");
+    }
+    CFRelease(deviceClass);
+    return platform;
+}
+
 void write_lldb_prep_cmds(AMDeviceRef device, CFURLRef disk_app_url) {
     CFStringRef symbols_path = copy_device_support_path(device, CFSTR("Symbols"));
     CFMutableStringRef cmds = CFStringCreateMutableCopy(NULL, 0, LLDB_PREP_CMDS);
     CFRange range = { 0, CFStringGetLength(cmds) };
+
+    CFStringFindAndReplace(cmds, CFSTR("{platform}"), get_device_platform(device), range, 0);
+    range.length = CFStringGetLength(cmds);
 
     CFStringFindAndReplace(cmds, CFSTR("{symbols_path}"), symbols_path, range, 0);
     range.length = CFStringGetLength(cmds);
@@ -1050,7 +1179,7 @@ void lldb_callback(CFSocketRef s, CFSocketCallBackType callbackType, CFDataRef a
         CFRelease(s);
         return;
     }
-    int sent = AMDServiceConnectionSend(dbgServiceConnection, CFDataGetBytePtr(data),  CFDataGetLength (data));
+    int __unused sent = AMDServiceConnectionSend(dbgServiceConnection, CFDataGetBytePtr(data),  CFDataGetLength (data));
     assert (CFDataGetLength (data) == sent);
 }
 
@@ -1087,9 +1216,9 @@ void start_remote_debug_server(AMDeviceRef device) {
 
     dbgServiceConnection = NULL;
     CFStringRef serviceName = CFSTR("com.apple.debugserver");
-    CFStringRef keys[] = { CFSTR("MinIPhoneVersion"), CFSTR("MinAppleTVVersion") };
-    CFStringRef values[] = { CFSTR("14.0"), CFSTR("14.0")};
-    CFDictionaryRef version = CFDictionaryCreate(NULL, (const void **)&keys, (const void **)&values, 2, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFStringRef keys[] = { CFSTR("MinIPhoneVersion"), CFSTR("MinAppleTVVersion"), CFSTR("MinWatchVersion") };
+    CFStringRef values[] = { CFSTR("14.0"), CFSTR("14.0"), CFSTR("7.0") }; // Not sure about older watchOS versions
+    CFDictionaryRef version = CFDictionaryCreate(NULL, (const void **)&keys, (const void **)&values, 3, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
 
     bool useSecureProxy = AMDeviceIsAtLeastVersionOnPlatform(device, version);
     if (useSecureProxy)
@@ -1225,7 +1354,7 @@ void lldb_finished_handler(int signum)
     _exit(WEXITSTATUS(status));
 }
 
-pid_t bring_process_to_foreground() {
+pid_t bring_process_to_foreground(void) {
     pid_t fgpid = tcgetpgrp(STDIN_FILENO);
     if (setpgid(0, 0) == -1)
         perror("setpgid failed");
@@ -1258,8 +1387,8 @@ void setup_lldb(AMDeviceRef device, CFURLRef url) {
     start_remote_debug_server(device);  // start debugserver
     if (!debugserver_only)
         write_lldb_prep_cmds(device, url);   // dump the necessary lldb commands into a file
-
-    CFRelease(url);
+    if (url != NULL)
+        CFRelease(url);
 
     NSLogOut(@"[100%%] Connecting to remote debug server");
     NSLogOut(@"-------------------------");
@@ -1364,23 +1493,33 @@ void launch_debugger_and_exit(AMDeviceRef device, CFURLRef url) {
 
 void launch_debugserver_only(AMDeviceRef device, CFURLRef url)
 {
-    CFRetain(url);
+    if (url != NULL)
+      CFRetain(url);
     setup_lldb(device,url);
 
-    CFStringRef bundle_identifier = copy_disk_app_identifier(url);
-    CFURLRef device_app_url = copy_device_app_url(device, bundle_identifier);
-    CFRelease(bundle_identifier);
-    CFStringRef device_app_path = CFURLCopyFileSystemPath(device_app_url, kCFURLPOSIXPathStyle);
-    CFRelease(device_app_url);
-    CFRelease(url);
+    CFStringRef device_app_path = NULL;
+    if (url != NULL) {
+      CFStringRef bundle_identifier = copy_disk_app_identifier(url);
+      CFURLRef device_app_url = copy_device_app_url(device, bundle_identifier);
+      CFRelease(bundle_identifier);
+      device_app_path = CFURLCopyFileSystemPath(device_app_url, kCFURLPOSIXPathStyle);
+      CFRelease(device_app_url);
+      CFRelease(url);
+    }
 
     NSLogOut(@"debugserver port: %d", port);
-    NSLogOut(@"App path: %@", device_app_path);
-    NSLogJSON(@{@"Event": @"DebugServerLaunched",
-                @"Port": @(port),
-                @"Path": (__bridge NSString *)device_app_path
-                });
-    CFRelease(device_app_path);
+    if (device_app_path == NULL) {
+        NSLogJSON(@{@"Event": @"DebugServerLaunched",
+                    @"Port": @(port),
+                    });
+    } else {
+        NSLogOut(@"App path: %@", device_app_path);
+        NSLogJSON(@{@"Event": @"DebugServerLaunched",
+                    @"Port": @(port),
+                    @"Path": (__bridge NSString *)device_app_path
+                    });
+        CFRelease(device_app_path);
+    }
 }
 
 CFStringRef copy_bundle_id(CFURLRef app_url)
@@ -1419,7 +1558,7 @@ CFStringRef copy_bundle_id(CFURLRef app_url)
     return bundle_id;
 }
 
-typedef enum { READ_DIR_FILE, READ_DIR_BEFORE_DIR, READ_DIR_AFTER_DIR } read_dir_cb_reason;
+typedef enum { READ_DIR_FILE, READ_DIR_FIFO, READ_DIR_BEFORE_DIR, READ_DIR_AFTER_DIR } read_dir_cb_reason;
 
 void read_dir(AFCConnectionRef afc_conn_p, const char* dir,
               void(*callback)(AFCConnectionRef conn, const char *dir, read_dir_cb_reason reason))
@@ -1429,6 +1568,7 @@ void read_dir(AFCConnectionRef afc_conn_p, const char* dir,
     afc_dictionary* afc_dict_p;
     char *key, *val;
     int not_dir = 0;
+    bool is_fifo = 0;
 
     unsigned int code = AFCFileInfoOpen(afc_conn_p, dir, &afc_dict_p);
     if (code != 0) {
@@ -1445,6 +1585,7 @@ void read_dir(AFCConnectionRef afc_conn_p, const char* dir,
     while((AFCKeyValueRead(afc_dict_p,&key,&val) == 0) && key && val) {
         if (strcmp(key,"st_ifmt")==0) {
             not_dir = strcmp(val,"S_IFDIR");
+            is_fifo = !strcmp(val, "S_IFIFO");
             if (_json_output) {
                 ifmt = [NSString stringWithUTF8String:val];
             } else {
@@ -1459,7 +1600,7 @@ void read_dir(AFCConnectionRef afc_conn_p, const char* dir,
         } else if (strcmp(key, "st_nlink") == 0) {
             nlink = atol(val);
         } else if (strcmp(key, "st_blocks") == 0) {
-            nlink = atol(val);
+            blocks = atol(val);
         }
     }
     AFCKeyValueClose(afc_dict_p);
@@ -1478,7 +1619,7 @@ void read_dir(AFCConnectionRef afc_conn_p, const char* dir,
     }
     
     if (not_dir) {
-        if (callback) (*callback)(afc_conn_p, dir, READ_DIR_FILE);
+        if (callback) (*callback)(afc_conn_p, dir, is_fifo ? READ_DIR_FIFO : READ_DIR_FILE);
         return;
     }
 
@@ -1630,7 +1771,7 @@ void* read_file_to_memory(char const * path, size_t* file_size)
 
 void list_files_callback(AFCConnectionRef conn, const char *name, read_dir_cb_reason reason)
 {
-    if (reason == READ_DIR_FILE) {
+    if (reason == READ_DIR_FILE || reason == READ_DIR_FIFO) {
         NSLogOut(@"%@", [NSString stringWithUTF8String:name]);
     } else if (reason == READ_DIR_BEFORE_DIR) {
         NSLogOut(@"%@/", [NSString stringWithUTF8String:name]);
@@ -1706,13 +1847,18 @@ void get_battery_level(AMDeviceRef device)
 void list_bundle_id(AMDeviceRef device)
 {
     connect_and_start_session(device);
-
-    NSArray *a = [NSArray arrayWithObjects:
-                  @"CFBundleIdentifier",
-                  @"CFBundleName",
-                  @"CFBundleDisplayName",
-                  @"CFBundleVersion",
-                  @"CFBundleShortVersionString", nil];
+    NSMutableArray *a = [NSMutableArray arrayWithObjects:
+                         @"CFBundleIdentifier",
+                         @"CFBundleName",
+                         @"CFBundleDisplayName",
+                         @"CFBundleVersion",
+                         @"CFBundleShortVersionString", nil];
+    if (keys) {
+        for (NSString * key in keys) {
+            [a addObjectsFromArray:[key componentsSeparatedByCharactersInSet:
+                                    [NSCharacterSet characterSetWithCharactersInString:@",&"]]];
+        }
+    }
     NSDictionary *optionsDict = [NSDictionary dictionaryWithObject:a forKey:@"ReturnAttributes"];
     CFDictionaryRef options = (CFDictionaryRef)optionsDict;
     CFDictionaryRef result = nil;
@@ -1743,7 +1889,7 @@ void copy_file_callback(AFCConnectionRef afc_conn_p, const char *name, read_dir_
 
     if (*local_name=='\0') return;
 
-    if (reason == READ_DIR_FILE) {
+    if (reason == READ_DIR_FILE || reason == READ_DIR_FIFO) {
         NSLogOut(@"%@", [NSString stringWithUTF8String:name]);
         afc_file_ref fref;
         int err = AFCFileRefOpen(afc_conn_p,name,1,&fref);
@@ -1829,7 +1975,7 @@ void upload_file(AMDeviceRef device)
         afc_conn_p = start_afc_service(device);
     } else {
         afc_conn_p = start_house_arrest_service(device);
-    } 
+    }
     assert(afc_conn_p);
 
     if (!target_filename)
@@ -1875,6 +2021,10 @@ void upload_single_file(AMDeviceRef device, AFCConnectionRef afc_conn_p, NSStrin
         check_error(AFCDirectoryCreate(afc_conn_p, [dirpath fileSystemRepresentation]));
     }
 
+    NSLogVerbose(@"%@", destinationPath);
+    NSLogJSON(@{@"Event": @"UploadFile",
+                @"Destination": destinationPath
+                });
 
     int ret = AFCFileRefOpen(afc_conn_p, [destinationPath fileSystemRepresentation], 3, &file_ref);
     if (ret == 0x000a) {
@@ -1901,6 +2051,11 @@ void upload_dir(AMDeviceRef device, AFCConnectionRef afc_conn_p, NSString* sourc
         [[NSFileManager defaultManager] fileExistsAtPath: sourcePath isDirectory: &isDir];
         if (isDir)
         {
+            NSString *dirDestinationPath = [destinationPath stringByAppendingString:@"/"];
+            NSLogVerbose(@"%@", dirDestinationPath);
+            NSLogJSON(@{@"Event": @"UploadDir",
+                        @"Destination": dirDestinationPath
+                        });
             upload_dir(device, afc_conn_p, sourcePath, destinationPath);
         }
         else
@@ -1940,7 +2095,9 @@ void rmtree_callback(AFCConnectionRef conn, const char *name, read_dir_cb_reason
 {
     if (reason == READ_DIR_FILE || reason == READ_DIR_AFTER_DIR) {
         NSLogVerbose(@"Deleting %s", name);
-        check_error(AFCRemovePath(conn, name));
+        log_error(AFCRemovePath(conn, name));
+    } else if (reason == READ_DIR_FIFO) {
+        NSLogVerbose(@"Skipping %s", name);
     }
 }
 
@@ -1982,6 +2139,251 @@ void uninstall_app(AMDeviceRef device) {
     }
 }
 
+void start_symbols_service_with_command(AMDeviceRef device, uint32_t command) {
+    connect_and_start_session(device);
+    check_error(AMDeviceSecureStartService(device, symbols_service_name,
+                                           NULL, &dbgServiceConnection));
+
+    uint32_t bytes_sent = AMDServiceConnectionSend(dbgServiceConnection, &command,
+                                                    sizeof_uint32_t);
+    if (bytes_sent != sizeof_uint32_t) {
+        on_error(@"Sent %d bytes but was expecting %d.", bytes_sent, sizeof_uint32_t);
+    }
+
+    uint32_t response;
+    uint32_t bytes_read = AMDServiceConnectionReceive(dbgServiceConnection,
+                                                        &response, sizeof_uint32_t);
+    if (bytes_read != sizeof_uint32_t) {
+        on_error(@"Read %d bytes but was expecting %d.", bytes_read, sizeof_uint32_t);
+    } else if (response != command) {
+        on_error(@"Failed to get confirmation response for: %s", command);
+    }
+}
+
+CFArrayRef get_dyld_file_paths(AMDeviceRef device) {
+    start_symbols_service_with_command(device, symbols_file_paths_command);
+
+    CFPropertyListFormat format;
+    CFDictionaryRef dict = NULL;
+    uint64_t bytes_read =
+        AMDServiceConnectionReceiveMessage(dbgServiceConnection, &dict, &format);
+    if (bytes_read == -1) {
+        on_error(@"Received %d bytes after succesfully starting command %d.", bytes_read,
+                 symbols_file_paths_command);
+    }
+    AMDeviceStopSession(device);
+    AMDeviceDisconnect(device);
+
+    CFStringRef files_key = CFSTR("files");
+    if (!CFDictionaryContainsKey(dict, files_key)) {
+        on_error(@"Incoming messasge did not contain key '%@', %@", files_key, dict);
+    }
+    return CFDictionaryGetValue(dict, files_key);
+}
+
+void write_dyld_file(CFStringRef dest, uint64_t file_size) {
+    // Prepare the destination file by mapping it into memory.
+    int fd = open(CFStringGetCStringPtr(dest, kCFStringEncodingUTF8),
+                  O_RDWR | O_CREAT, 0644);
+    if (fd == -1) {
+        on_sys_error(@"Failed to open %@.", dest);
+    }
+    if (lseek(fd, file_size - 1, SEEK_SET) == -1) {
+        on_sys_error(@"Failed to lseek to last byte.");
+    }
+    if (write(fd, "", 1) == -1) {
+        on_sys_error(@"Failed to write to last byte.");
+    }
+    void *map = mmap(NULL, file_size, PROT_WRITE, MAP_SHARED, fd, 0);
+    if (map == MAP_FAILED) {
+        on_sys_error(@"Failed to mmap %@.", dest);
+    }
+    close(fd);
+
+    // Read the file content packet by packet until we've copied the entire file
+    // to disk.
+    uint64_t total_bytes_read = 0;
+    uint64_t last_time =
+        get_current_time_in_milliseconds() / symbols_logging_interval_ms;
+    while (total_bytes_read < file_size) {
+        uint64_t bytes_remaining = file_size - total_bytes_read;
+        // This fails for some reason if we try to download more than
+        // INT_MAX bytes at a time.
+        uint64_t bytes_to_download = MIN(bytes_remaining, INT_MAX - 1);
+        uint64_t bytes_read = AMDServiceConnectionReceive(
+            dbgServiceConnection, map + total_bytes_read, bytes_to_download);
+        total_bytes_read += bytes_read;
+
+        uint64_t current_time =
+            get_current_time_in_milliseconds() / symbols_logging_interval_ms;
+        // We can process several packets per second which would result
+        // in spamming output so only log if any of the following are
+        // true:
+        //    - Running in verbose mode.
+        //    - It's been at least a quarter second since the last log.
+        //    - We finished processing the last packet.
+        if (verbose || last_time != current_time || total_bytes_read == file_size) {
+            last_time = current_time;
+            int percent = (double)total_bytes_read / file_size * 100;
+            NSLogOut(@"%llu/%llu (%d%%)", total_bytes_read, file_size, percent);
+            NSLogJSON(@{@"Event": @"DyldCacheDownloadProgress",
+                         @"BytesRead": @(total_bytes_read),
+                         @"Percent": @(percent),
+                      });
+        }
+    }
+
+    munmap(map, file_size);
+}
+
+CFStringRef download_dyld_file(AMDeviceRef device, uint32_t dyld_index,
+                        CFStringRef filepath) {
+    start_symbols_service_with_command(device, symbols_download_file_command);
+
+    uint32_t index = CFSwapInt32HostToBig(dyld_index);
+    uint64_t bytes_sent =
+        AMDServiceConnectionSend(dbgServiceConnection, &index, sizeof_uint32_t);
+    if (bytes_sent != sizeof_uint32_t) {
+        on_error(@"Sent %d bytes but was expecting %d.", bytes_sent, sizeof_uint32_t);
+    }
+
+    uint64_t file_size = 0;
+    uint64_t bytes_read = AMDServiceConnectionReceive(dbgServiceConnection,
+                                                    &file_size, sizeof(uint64_t));
+    if (bytes_read != sizeof(uint64_t)) {
+        on_error(@"Read %d bytes but was expecting %d.", bytes_read, sizeof(uint64_t));
+    }
+    file_size = CFSwapInt64BigToHost(file_size);
+
+    CFStringRef download_path = CFStringCreateWithFormat(
+        NULL, NULL, CFSTR("%s%@"), symbols_download_directory, filepath);
+    mkdirp(
+        ((__bridge NSString *)download_path).stringByDeletingLastPathComponent);
+    NSLogOut(@"Downloading %@ to %@.", filepath, download_path);
+    NSLogJSON(@{@"Event": @"DyldCacheDownload",
+                 @"Source": (__bridge NSString *)filepath,
+                 @"Destination": (__bridge NSString *)download_path,
+                 @"Size": @(file_size),
+              });
+
+    write_dyld_file(download_path, file_size);
+
+    AMDeviceStopSession(device);
+    AMDeviceDisconnect(device);
+    return download_path;
+}
+
+CFStringRef create_dsc_bundle_path_for_device(AMDeviceRef device) {
+    CFStringRef xcode_dev_path = copy_xcode_dev_path();
+
+    AMDeviceConnect(device);
+    CFStringRef device_class = AMDeviceCopyValue(device, 0, CFSTR("DeviceClass"));
+    AMDeviceDisconnect(device);
+
+    CFStringRef platform_name;
+    if (CFStringCompare(CFSTR("AppleTV"), device_class, 0) == kCFCompareEqualTo) {
+        platform_name = CFSTR("AppleTVOS");
+    } else if (CFStringCompare(CFSTR("Watch"), device_class, 0) ==
+               kCFCompareEqualTo) {
+        platform_name = CFSTR("WatchOS");
+    } else {
+        platform_name = CFSTR("iPhoneOS");
+    }
+
+    return CFStringCreateWithFormat(
+        NULL, NULL,
+        CFSTR("%@/Platforms/%@.platform/usr/lib/dsc_extractor.bundle"),
+        xcode_dev_path, platform_name);
+}
+
+typedef int (*extractor_proc)(const char *shared_cache_file_path, const char *extraction_root_path,
+                              void (^progress)(unsigned current, unsigned total));
+
+void dyld_shared_cache_extract_dylibs(CFStringRef dsc_extractor_bundle_path,
+                                      CFStringRef shared_cache_file_path,
+                                      const char *extraction_root_path) {
+    const char *dsc_extractor_bundle_path_ptr =
+        CFStringGetCStringPtr(dsc_extractor_bundle_path, kCFStringEncodingUTF8);
+    void *handle = dlopen(dsc_extractor_bundle_path_ptr, RTLD_LAZY);
+    if (handle == NULL) {
+        on_error(@"%s could not be loaded", dsc_extractor_bundle_path);
+    }
+
+    extractor_proc proc = (extractor_proc)dlsym(
+        handle, "dyld_shared_cache_extract_dylibs_progress");
+    if (proc == NULL) {
+        on_error(
+            @"%s did not have dyld_shared_cache_extract_dylibs_progress symbol",
+            dsc_extractor_bundle_path);
+    }
+
+    const char *shared_cache_file_path_ptr =
+        CFStringGetCStringPtr(shared_cache_file_path, kCFStringEncodingUTF8);
+  
+    NSLogJSON(@{@"Event": @"DyldCacheExtract",
+                 @"Source": (__bridge NSString *)shared_cache_file_path,
+                 @"Destination": @(extraction_root_path),
+              });
+
+    __block uint64_t last_time =
+        get_current_time_in_milliseconds() / symbols_logging_interval_ms;
+    __block unsigned files_extracted = 0;
+    __block unsigned files_total = 0;
+    int result =
+        (*proc)(shared_cache_file_path_ptr, extraction_root_path,
+                ^(unsigned c, unsigned total) {
+              uint64_t current_time =
+                  get_current_time_in_milliseconds() / symbols_logging_interval_ms;
+              if (!verbose && last_time == current_time) return;
+
+              last_time = current_time;
+              files_extracted = c;
+              files_total = total;
+          
+              int percent = (double)c / total * 100;
+              NSLogOut(@"%d/%d (%d%%)", c, total, percent);
+              NSLogJSON(@{@"Event": @"DyldCacheExtractProgress",
+                           @"Extracted": @(c),
+                           @"Total": @(total),
+                           @"Percent": @(percent),
+                        });
+        });
+    if (result == 0) {
+        NSLogOut(@"Finished extracting %s.", shared_cache_file_path_ptr);
+        files_extracted = files_total;
+    } else {
+        NSLogOut(@"Failed to extract %s, exit code %d.", shared_cache_file_path_ptr, result);
+    }
+    int percent = (double)files_extracted / files_total * 100;
+    NSLogJSON(@{@"Event": @"DyldCacheExtractProgress",
+                @"Code": @(result),
+                @"Extracted": @(files_extracted),
+                @"Total": @(files_total),
+                @"Percent": @(percent),
+              });
+}
+
+void download_device_symbols(AMDeviceRef device) {
+    dbgServiceConnection = NULL;
+    CFArrayRef files = get_dyld_file_paths(device);
+    CFIndex files_count = CFArrayGetCount(files);
+    NSLogOut(@"Downloading symbols files: %@", files);
+    NSLogJSON(@{@"Event": @"SymbolsDownload",
+                 @"Files": (__bridge NSArray *)files,
+              });
+    CFStringRef dsc_extractor_bundle = create_dsc_bundle_path_for_device(device);
+
+    for (uint32_t i = 0; i < files_count; ++i) {
+        CFStringRef filepath = (CFStringRef)CFArrayGetValueAtIndex(files, i);
+        CFStringRef download_path = download_dyld_file(device, i, filepath);
+        dyld_shared_cache_extract_dylibs(dsc_extractor_bundle, download_path,
+                                             symbols_download_directory);
+        CFRelease(download_path);
+    }
+
+    CFRelease(dsc_extractor_bundle);
+}
+
 void handle_device(AMDeviceRef device) {
     NSLogVerbose(@"Already found device? %d", found_device);
 
@@ -1999,13 +2401,18 @@ void handle_device(AMDeviceRef device) {
         found_device = true;
         return;
     }
+    if (found_device)
+    {
+        NSLogVerbose(@"Skipping %@.", device_full_name);
+        return;
+    }
     CFStringRef found_device_id = CFAutorelease(AMDeviceCopyDeviceIdentifier(device));
     if (device_id != NULL) {
         CFStringRef deviceCFSTR = CFAutorelease(CFStringCreateWithCString(NULL, device_id, kCFStringEncodingUTF8));
         if (CFStringCompare(deviceCFSTR, found_device_id, kCFCompareCaseInsensitive) == kCFCompareEqualTo) {
             found_device = true;
         } else {
-            NSLogOut(@"Skipping %@.", device_full_name);
+            NSLogVerbose(@"Skipping %@.", device_full_name);
             return;
         }
     } else {
@@ -2037,10 +2444,16 @@ void handle_device(AMDeviceRef device) {
             list_bundle_id(device);
         } else if (strcmp("get_battery_level", command) == 0) {
             get_battery_level(device);
+        } else if (strcmp("symbols", command) == 0) {
+            download_device_symbols(device);
         }
         exit(0);
     }
 
+    if (debugserver_only && app_path == NULL) {
+        launch_debugserver_only(device, NULL);
+        return;
+    }
 
     CFRetain(device); // don't know if this is necessary?
 
@@ -2083,38 +2496,29 @@ void handle_device(AMDeviceRef device) {
         NSLogOut(@"------ Install phase ------");
         NSLogOut(@"[  0%%] Found %@ connected through %@, beginning install", device_full_name, device_interface_name);
 
+        CFStringRef install_bundle_id = NULL;
+        if (bundle_id != NULL) {
+          install_bundle_id = CFStringCreateWithCString(NULL, bundle_id, kCFStringEncodingUTF8);
+        } else {
+          CFStringRef extracted_bundle_id = copy_bundle_id(url);
+          if (extracted_bundle_id == NULL) {
+            on_error(@"[ ERROR] Could not determine bundle id.");
+          }
+          install_bundle_id = extracted_bundle_id;
+        }
+
         CFDictionaryRef options;
         if (app_deltas == NULL) { // standard install
-          // NOTE: the secure version doesn't seem to require us to start the AFC service
-          ServiceConnRef afcFd;
-          connect_and_start_session(device);
-          check_error(AMDeviceSecureStartService(device, CFSTR("com.apple.afc"), NULL, &afcFd));
-          check_error(AMDeviceStopSession(device));
-          check_error(AMDeviceDisconnect(device));
-
           CFStringRef keys[] = { CFSTR("PackageType") };
           CFStringRef values[] = { CFSTR("Developer") };
           options = CFDictionaryCreate(NULL, (const void **)&keys, (const void **)&values, 1, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
           check_error(AMDeviceSecureTransferPath(0, device, url, options, transfer_callback, 0));
-          AMDServiceConnectionInvalidate(afcFd);
 
           connect_and_start_session(device);
           check_error(AMDeviceSecureInstallApplication(0, device, url, options, install_callback, 0));
           check_error(AMDeviceStopSession(device));
           check_error(AMDeviceDisconnect(device));
         } else { // incremental install
-          CFStringRef extracted_bundle_id = NULL;
-          CFStringRef extracted_bundle_id_ref = copy_bundle_id(url);
-          if (bundle_id != NULL) {
-            extracted_bundle_id = CFStringCreateWithCString(NULL, bundle_id, kCFStringEncodingUTF8);
-            CFRelease(extracted_bundle_id_ref);
-          } else {
-            if (extracted_bundle_id_ref == NULL) {
-              on_error(@"[ ERROR] Could not determine bundle id.");
-            }
-            extracted_bundle_id = extracted_bundle_id_ref;
-          }
-
           CFStringRef deltas_path =
             CFStringCreateWithCString(NULL, app_deltas, kCFStringEncodingUTF8);
           CFURLRef deltas_relative_url =
@@ -2133,7 +2537,7 @@ void handle_device(AMDeviceRef device) {
             CFSTR("ShadowParentKey"),
           };
           CFStringRef values[] = {
-            extracted_bundle_id,
+            install_bundle_id,
             CFSTR("1"),
             CFSTR("1"),
             CFSTR("1"),
@@ -2147,7 +2551,6 @@ void handle_device(AMDeviceRef device) {
 
           // Incremental installs should be done without a session started because of timeouts.
           check_error(AMDeviceSecureInstallApplicationBundle(device, url, options, incremental_install_callback, 0));
-          CFRelease(extracted_bundle_id);
           CFRelease(deltas_path);
           CFRelease(deltas_relative_url);
           CFRelease(app_deltas_url);
@@ -2157,12 +2560,24 @@ void handle_device(AMDeviceRef device) {
 
         CFRelease(options);
 
+        connect_and_start_session(device);
+        CFURLRef device_app_url = copy_device_app_url(device, install_bundle_id);
+        check_error(AMDeviceStopSession(device));
+        check_error(AMDeviceDisconnect(device));
+        CFStringRef device_app_path = CFURLCopyFileSystemPath(device_app_url, kCFURLPOSIXPathStyle);
+
         NSLogOut(@"[100%%] Installed package %@", [NSString stringWithUTF8String:app_path]);
+        NSLogVerbose(@"App path: %@", device_app_path);
         NSLogJSON(@{@"Event": @"BundleInstall",
                     @"OverallPercent": @(100),
                     @"Percent": @(100),
-                    @"Status": @"Complete"
+                    @"Status": @"Complete",
+                    @"Path": (__bridge NSString *)device_app_path
                     });
+
+      CFRelease(device_app_url);
+      CFRelease(install_bundle_id);
+      CFRelease(device_app_path);
     }
     CFRelease(path);
 
@@ -2181,21 +2596,29 @@ void handle_device(AMDeviceRef device) {
 void device_callback(struct am_device_notification_callback_info *info, void *arg) {
     switch (info->msg) {
         case ADNCI_MSG_CONNECTED:
-            if (no_wifi && AMDeviceGetInterfaceType(info->dev) == 2)
+        {
+            int itype = AMDeviceGetInterfaceType(info->dev);
+            if (no_wifi &&  (itype == 2 || ( itype == 3 && get_companion_interface_type(info->dev) == 2)))
             {
-                NSLogVerbose(@"Skipping wifi device (type: %d)", AMDeviceGetInterfaceType(info->dev));
+                NSLogVerbose(@"Skipping wifi device (type: %d)", itype);
             }
             else
             {
-                NSLogVerbose(@"Handling device type: %d", AMDeviceGetInterfaceType(info->dev));
+                NSLogVerbose(@"Handling device type: %d", itype);
                 handle_device(info->dev);
             }
             break;
+        }
         case ADNCI_MSG_DISCONNECTED:
         {
             CFStringRef device_interface_name = get_device_interface_name(info->dev);
             CFStringRef device_uuid = AMDeviceCopyDeviceIdentifier(info->dev);
-            NSLogOut(@"[....] Disconnected %@ from %@.", device_uuid, device_interface_name);
+            NSLogVerbose(@"[....] Disconnected %@ from %@.", device_uuid, device_interface_name);
+            if (detect_only && _json_output) {
+                NSLogJSON(@{@"Event": @"DeviceDisconnected",
+                            @"Device": get_device_json_dict(info->dev)
+                            });
+            }
             CFRelease(device_uuid);
             break;
         }
@@ -2278,13 +2701,16 @@ void usage(const char* app) {
         @"  --detect_deadlocks <sec>     start printing backtraces for all threads periodically after specific amount of seconds\n"
         @"  -f, --file_system            specify file system for mkdir / list / upload / download / rm\n"
         @"  -F, --non-recursively        specify non-recursively walk directory\n"
+        @"  -S, --symbols                download OS symbols. must specify a directory to store the downloaded symbols\n"
         @"  -j, --json                   format output as JSON\n"
+        @"  -k, --key                    keys for the properties of the bundle. Joined by ',' and used only with -B <list_bundle_id> and -j <json> \n"
         @"  --custom-script <script>     path to custom python script to execute in lldb\n"
-        @"  --custom-command <command>   specify additional lldb commands to execute\n",
+        @"  --custom-command <command>   specify additional lldb commands to execute\n"
+        @"  --faster-path-search         use alternative logic to find the device support paths faster\n",
         [NSString stringWithUTF8String:app]);
 }
 
-void show_version() {
+void show_version(void) {
     NSLogOut(@"%@", @
 #include "version.h"
              );
@@ -2336,13 +2762,16 @@ int main(int argc, char *argv[]) {
         { "app_deltas", required_argument, NULL, 'A'},
         { "file_system", no_argument, NULL, 'f'},
         { "non-recursively", no_argument, NULL, 'F'},
+        { "key", optional_argument, NULL, 'k' },
+        { "symbols", required_argument, NULL, 'S' },
         { "custom-script", required_argument, NULL, 1001},
         { "custom-command", required_argument, NULL, 1002},
+        { "faster-path-search", no_argument, NULL, 1003},
         { NULL, 0, NULL, 0 },
     };
     int ch;
 
-    while ((ch = getopt_long(argc, argv, "VmcdvunrILefFD:R:X:i:b:a:t:p:1:2:o:l:w:9BWjNs:OE:CA:", longopts, NULL)) != -1)
+    while ((ch = getopt_long(argc, argv, "VmcdvunrILefFD:R:X:i:b:a:t:p:1:2:o:l:w:9BWjNs:OE:CA:k:S:", longopts, NULL)) != -1)
     {
         switch (ch) {
         case 'm':
@@ -2363,6 +2792,11 @@ int main(int argc, char *argv[]) {
             break;
         case 's':
             envs = optarg;
+            break;
+        case 'S':
+            symbols_download_directory = optarg;
+            command = "symbols";
+            command_only = true;
             break;
         case 'v':
             verbose = true;
@@ -2488,6 +2922,13 @@ int main(int argc, char *argv[]) {
             }
             [custom_commands appendFormat:@"%s\n", optarg];
             break;
+        case 1003:
+            faster_path_search = true;
+            break;
+        case 'k':
+            if (!keys) keys = [[NSMutableArray alloc] init];
+            [keys addObject: [NSString stringWithUTF8String:optarg]];
+            break;
         default:
             usage(argv[0]);
             return exitcode_error;
@@ -2499,9 +2940,9 @@ int main(int argc, char *argv[]) {
         on_error(@"The --args and --envs options can not be combined with --nolldb.");
     }
 
-    if (!app_path && !detect_only && !command_only) {
+    if (!app_path && !detect_only && !debugserver_only && !command_only) {
         usage(argv[0]);
-        on_error(@"One of -[b|c|o|l|w|D|R|e|9] is required to proceed!");
+        on_error(@"One of -[b|c|o|l|w|D|N|R|X|e|B|C|S|9] is required to proceed!");
     }
 
     if (unbuffered) {
@@ -2531,6 +2972,15 @@ int main(int argc, char *argv[]) {
         NSLogOut(@"[....] Waiting for iOS device to be connected");
     }
 
-    AMDeviceNotificationSubscribe(&device_callback, 0, 0, NULL, &notify);
+
+    CFStringRef keys[] = {
+        CFSTR("NotificationOptionSearchForPairedDevices"),
+    };
+    const void* values[] = {
+        kCFBooleanTrue,
+    };
+    CFDictionaryRef options = CFDictionaryCreate(kCFAllocatorDefault, (const void**)keys, values, 1, &kCFCopyStringDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+
+    AMDeviceNotificationSubscribeWithOptions(&device_callback, 0, 0, NULL, &notify, options);
     CFRunLoopRun();
 }
